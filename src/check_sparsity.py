@@ -11,32 +11,48 @@ def load_model(model_path, dtype, device_map, cache_dir):
         cache_dir=cache_dir
     )
 
-def compute_deltas(sft_model, rl_model):
+def compute_statistics_incremental(sft_model, rl_model, tolerances):
     rl_state_dict = rl_model.state_dict()
     sft_state_dict = sft_model.state_dict()
-
+    
     missing_in_rl = [name for name in sft_state_dict if name not in rl_state_dict]
     missing_in_sft = [name for name in rl_state_dict if name not in sft_state_dict]
-
+    
     if missing_in_rl or missing_in_sft:
         print("Missing in RL:", missing_in_rl)
         print("Missing in SFT:", missing_in_sft)
-
-    all_deltas = []
-    param_sizes = []
+    
+    # Initialize counters
+    total_params = 0
+    num_zeros = 0
+    num_close_to_zero = {tol: 0 for tol in tolerances}
     num_nonzero_dict = {}
-
+    
     with torch.no_grad():
-        for name, param_sft in tqdm(sft_model.named_parameters(), desc="Computing deltas"):
-            try:
-                delta = rl_state_dict[name] - sft_state_dict[name]
-                num_nonzero = (delta != 0).sum().item()
-                num_nonzero_dict[name] = num_nonzero / delta.numel()
-                param_sizes.append(delta.numel())
-                all_deltas.append(delta.view(-1))
-            except Exception as e:
-                print(f"Error in {name}: {e}")
-    return all_deltas, num_nonzero_dict
+        for name, param_sft in tqdm(sft_model.named_parameters(), desc="Computing statistics"):
+            delta = rl_state_dict[name] - sft_state_dict[name]
+            
+            # Move to CPU to save GPU memory
+            delta_cpu = delta.cpu()
+            
+            # Update statistics
+            total_params += delta_cpu.numel()
+            num_zeros += (delta_cpu == 0).sum().item()
+            
+            # Check tolerance levels
+            zero_tensor = torch.zeros_like(delta_cpu)
+            for tol in tolerances:
+                num_close_to_zero[tol] += torch.isclose(
+                    delta_cpu, zero_tensor, atol=tol
+                ).sum().item()
+            
+            # Store per-parameter sparsity
+            num_nonzero_dict[name] = (delta_cpu != 0).sum().item() / delta_cpu.numel()
+            
+            # Free memory
+            del delta, delta_cpu
+    
+    return total_params, num_zeros, num_close_to_zero, num_nonzero_dict
 
 def compute_layerwise_sparsity(num_nonzero_dict):
     layerwise_sparsity = {}
@@ -44,18 +60,18 @@ def compute_layerwise_sparsity(num_nonzero_dict):
         if key.startswith("model.layers"):
             layer = key.split(".")[2]
             layerwise_sparsity.setdefault(layer, []).append(num_nonzero_dict[key])
-
+    
     # Average sparsity per layer
     layerwise_sparsity = {
         layer: sum(vals) / len(vals)
         for layer, vals in layerwise_sparsity.items()
     }
-
+    
     # Print
     print("\nLayer-wise sparsity:")
     for layer, sparsity in sorted(layerwise_sparsity.items(), key=lambda x: int(x[0])):
         print(f"Layer {layer}: {sparsity:.4f}")
-
+    
     return layerwise_sparsity
 
 def main(args):
@@ -63,22 +79,20 @@ def main(args):
     dtype = getattr(torch, args.torch_dtype)
     model_sft = load_model(args.sft_model, dtype, args.device_map, args.cache_dir)
     model_rl = load_model(args.rl_model, dtype, args.device_map, args.cache_dir)
-
-    # Compute deltas
-    all_deltas, num_nonzero_dict = compute_deltas(model_sft, model_rl)
-    all_deltas_tensor = torch.cat(all_deltas, dim=0)
-    print(f"\nDeltas shape: {all_deltas_tensor.size()}")
-
-    pct_zeros = (all_deltas_tensor == 0).sum().item() / len(all_deltas_tensor)
+    
+    # Compute statistics incrementally
+    total_params, num_zeros, num_close_to_zero, num_nonzero_dict = compute_statistics_incremental(
+        model_sft, model_rl, args.tolerances
+    )
+    
+    print(f"\nTotal parameters: {total_params:,}")
+    pct_zeros = num_zeros / total_params
     print(f"Percentage of 0 values in the task vector: {pct_zeros:.4f}")
-
-    zero_tensor = torch.zeros_like(all_deltas_tensor)
+    
     for tol in args.tolerances:
-        fraction_close_to_zero = torch.isclose(
-            all_deltas_tensor, zero_tensor, atol=tol
-        ).sum().item() / all_deltas_tensor.numel()
+        fraction_close_to_zero = num_close_to_zero[tol] / total_params
         print(f"Tolerance = {tol:.0e} -> Fraction close to zero: {fraction_close_to_zero:.4f}")
-
+    
     # Compute layer-wise sparsity
     compute_layerwise_sparsity(num_nonzero_dict)
 
@@ -96,5 +110,6 @@ if __name__ == "__main__":
                         help="Device map for model loading (default: cpu)")
     parser.add_argument("--tolerances", type=float, nargs="+", default=[1e-5],
                         help="List of tolerances to use for zero-check")
+    
     args = parser.parse_args()
     main(args)
